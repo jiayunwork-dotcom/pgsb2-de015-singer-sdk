@@ -82,6 +82,25 @@ The Singer protocol messages (like `RECORD`, `SCHEMA`, `STATE`, and `BATCH`) are
 
 The `manifest` field is used to specify the paths to the batch files. The paths are relative to the `root` directory specified in the [`batch_config`](#batch-configuration) storage configuration.
 
+### Error handling
+
+When processing a `BATCH` message:
+
+- If the `BATCH` arrives before the stream's `SCHEMA`, a `RecordsWithoutSchemaException`
+  is raised, just as it would be for a `RECORD` message.
+- If a file does not exist, cannot be read, or uses an unsupported encoding, an
+  `InvalidBatchFileError` (`NotImplementedError` for unsupported formats) is raised
+  with the file path in the message.
+- If a line is not valid JSON or not a JSON object, an `InvalidBatchFileError` is
+  raised with the file path and the 1-based line number in the message.
+- With `validate_records` enabled, records are validated exactly as `RECORD` messages
+  are, and `fail_on_record_validation_exception` determines whether validation
+  failures abort the sync. The exception or log message additionally includes the
+  file path and 1-based line number.
+
+Records processed before the error keep the effects they would have had in the
+equivalent `RECORD` stream; no rollback is attempted.
+
 ## Batch configuration
 
 When local storage is used, targets do no require special configuration to process `BATCH` messages. Use of AWS S3 assumes S3/AWS credentials are already discoverable via the underlying S3 libraries (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION`)
@@ -130,13 +149,30 @@ Targets can optionally customize the batch file processing by implementing the [
 
 ```python
 class MySink(Sink):
-    def process_batch_files(self, encoding, storage, files):
+    def process_batch_files(self, encoding, files):
         # process the batch files
 ```
+
+If the stream has any effective [stream maps](https://sdk.meltano.com/en/latest/stream_maps.html)
+or flattening configured, the SDK cannot hand the raw files to this method, because
+the mappings would be skipped. In that case a `StreamMapsNotSupportedError` is raised
+before any file is read.
+
+## Equivalence with `RECORD` messages
+
+For a target, a `BATCH` message is equivalent to the `RECORD` messages obtained by
+expanding each file in its manifest, in the listed order, and each file one line at a
+time, at the position the `BATCH` message occupied. Expanded records use the batch's
+`stream` and the batch message's `time_extracted` and `version` values, when present.
+
+This means that [stream maps](https://sdk.meltano.com/en/latest/stream_maps.html) and
+flattening are applied to batch records exactly as they are to individual records, and
+that `validate_records`, `add_record_metadata`, key property checks,
+`Sink.preprocess_record`, and `batch_size_rows` all behave the same for both message
+types.
 
 ## Known Limitations of `BATCH`
 
 1. Currently the built-in `BATCH` implementation does not support incremental bookmarks or `STATE` tracking. This work is tracked in [Issue #976](https://github.com/meltano/sdk/issues/976).
-1. The `BATCH` implementation is not currently compatible with [Stream Maps](https://sdk.meltano.com/en/latest/stream_maps.html). This is certainly possible to implement in theory, but it would also introduce some performance penalties. This limitation is tracked in [Issue 1117#](https://github.com/meltano/sdk/issues/1117).
 
-If you are interested in contributing to one or both of these features, please add a comment in the respective issue.
+If you are interested in contributing to this feature, please add a comment in the issue.

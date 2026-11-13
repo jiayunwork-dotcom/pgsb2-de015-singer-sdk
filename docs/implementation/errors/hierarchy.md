@@ -27,6 +27,7 @@ SingerSDKError
 │   │   ├── InvalidStreamSortException
 │   │   ├── MissingKeyPropertiesError
 │   │   ├── RecordsWithoutSchemaException
+│   │   ├── StreamMapsNotSupportedError
 │   │   ├── TapStreamConnectionFailure
 │   │   └── TooManyRecordsException
 │   ├── RetriableSyncError
@@ -35,6 +36,7 @@ SingerSDKError
 │   │   ├── IgnorableAPIError
 │   │   └── InvalidRecord
 │   └── DataError
+│       ├── InvalidBatchFileError
 │       └── InvalidJSONSchema
 └── SyncLifecycleSignal
     ├── RequestedAbortException
@@ -122,7 +124,8 @@ The SDK should **abort the sync immediately** and exit with a non-zero code.
 | `FatalAPIError` | An HTTP/API error that cannot be retried (e.g. 403 Forbidden, 400 Bad Request). |
 | `TapStreamConnectionFailure` | The stream connection was lost and cannot be recovered. |
 | `TooManyRecordsException` | The query returned more records than `max_records` allows. |
-| `RecordsWithoutSchemaException` | A target received `RECORD` messages before the corresponding `SCHEMA` message. |
+| `RecordsWithoutSchemaException` | A target received `RECORD` or `BATCH` messages before the corresponding `SCHEMA` message. |
+| `StreamMapsNotSupportedError` | A sink overrides `process_batch_files`, but stream maps or flattening are configured for its stream, so the raw files cannot be processed without skipping the mappings. |
 | `MissingKeyPropertiesError` | A received record is missing one or more declared key properties. |
 | `InvalidStreamSortException` | Records arrived out of order, violating the stream's sort invariant. |
 
@@ -192,6 +195,7 @@ and continues; severity is configurable.
 | Class | When raised |
 |---|---|
 | `InvalidJSONSchema` | A stream's declared JSON Schema is structurally invalid. |
+| `InvalidBatchFileError` | A `BATCH` file cannot be read, uses an unsupported encoding/compression, or contains a line that is not a valid JSON object. Carries `.path` and `.line_number` when known. |
 
 ______________________________________________________________________
 

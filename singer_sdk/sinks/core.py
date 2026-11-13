@@ -17,6 +17,7 @@ import jsonschema
 
 from singer_sdk import metrics
 from singer_sdk.exceptions import (
+    InvalidBatchFileError,
     InvalidJSONSchema,
     InvalidRecord,
     MissingKeyPropertiesError,
@@ -41,11 +42,137 @@ else:
     from typing_extensions import override
 
 if t.TYPE_CHECKING:
-    from gzip import GzipFile
     from logging import Logger
 
     from singer_sdk.helpers._batch import BaseBatchFileEncoding
     from singer_sdk.target_base import Target
+
+_NO_COMPRESSION: t.Final[frozenset[str | None]] = frozenset({None, "none"})
+_SUPPORTED_JSONL_COMPRESSIONS: t.Final[frozenset[str | None]] = frozenset(
+    {*_NO_COMPRESSION, "gzip"},
+)
+
+
+def _parse_jsonl_records(
+    file: t.IO[bytes],
+    path: str,
+) -> t.Iterator[tuple[int, dict]]:
+    """Parse JSONL file contents, yielding ``(line_number, record)`` pairs.
+
+    Args:
+        file: The binary file object to read.
+        path: The URL or path of the file, used in error messages.
+
+    Yields:
+        One ``(1-based line number, record dict)`` pair per line.
+
+    Raises:
+        InvalidBatchFileError: If a line is not valid JSON or not a JSON object.
+    """
+    for line_number, line in enumerate(file, start=1):
+        try:
+            record = deserialize_json(line)
+        except Exception as ex:
+            msg = (
+                f"Unable to parse line {line_number} of batch file '{path}' "
+                f"as JSON: {ex}"
+            )
+            raise InvalidBatchFileError(
+                msg,
+                path=path,
+                line_number=line_number,
+            ) from ex
+
+        if not isinstance(record, dict):
+            msg = (
+                f"Unable to parse line {line_number} of batch file '{path}': "
+                "not a JSON object."
+            )
+            raise InvalidBatchFileError(
+                msg,
+                path=path,
+                line_number=line_number,
+            ) from None
+
+        yield line_number, record
+
+
+def iter_batch_file_records(
+    encoding: BaseBatchFileEncoding,
+    path: str,
+    storage: StorageTarget | None = None,
+) -> t.Iterator[tuple[int, dict]]:
+    """Read a batch file, yielding ``(record_number, record)`` pairs.
+
+    The record number is 1-based: for JSONL it is the line number, and for Parquet
+    it is the row number.
+
+    Args:
+        encoding: The batch file encoding.
+        path: The URL or path of the batch file.
+        storage: Optional storage root to resolve ``path`` against.
+
+    Yields:
+        One ``(record_number, record dict)`` pair per record in the file.
+
+    Raises:
+        InvalidBatchFileError: If the file cannot be read or parsed.
+        NotImplementedError: If the encoding format is unsupported (or Parquet is
+            used without ``pyarrow`` installed).
+    """  # noqa: D401
+    head, tail = StorageTarget.split_url(path)
+    file_storage = storage or StorageTarget.from_url(head)
+
+    if encoding.format == BatchFileFormat.JSONL:
+        if encoding.compression not in _SUPPORTED_JSONL_COMPRESSIONS:
+            msg = (
+                f"Unsupported batch compression '{encoding.compression}' for file "
+                f"'{path}'."
+            )
+            raise InvalidBatchFileError(msg, path=path)
+
+        try:
+            with file_storage.open(tail, mode="rb") as file:
+                if encoding.compression == "gzip":
+                    with gzip_open(file) as context_file:
+                        yield from _parse_jsonl_records(context_file, path)
+                else:
+                    yield from _parse_jsonl_records(file, path)
+        except InvalidBatchFileError:
+            raise
+        except Exception as ex:
+            msg = f"Unable to read batch file '{path}': {ex}"
+            raise InvalidBatchFileError(msg, path=path) from ex
+
+    elif (
+        importlib.util.find_spec("pyarrow")
+        and encoding.format == BatchFileFormat.PARQUET
+    ):
+        import pyarrow.parquet as pq  # noqa: PLC0415
+
+        try:
+            with file_storage.open(tail, mode="rb") as file:
+                table = pq.read_table(file)
+        except Exception as ex:
+            msg = f"Unable to read batch file '{path}': {ex}"
+            raise InvalidBatchFileError(msg, path=path) from ex
+
+        for row_number, record in enumerate(table.to_pylist(), start=1):
+            if not isinstance(record, dict):
+                msg = (
+                    f"Unable to parse row {row_number} of batch file "
+                    f"'{path}': not a JSON object."
+                )
+                raise InvalidBatchFileError(
+                    msg,
+                    path=path,
+                    line_number=row_number,
+                ) from None
+            yield row_number, record
+
+    else:
+        msg = f"Unsupported batch encoding format: {encoding.format} (file '{path}')"
+        raise NotImplementedError(msg)
 
 
 class BaseJSONSchemaValidator(abc.ABC):
@@ -159,6 +286,7 @@ class Sink(abc.ABC):  # noqa: PLR0904
         self.sync_started_at = target.initialized_at
         self._config = dict(target.config)
         self._pending_batch: dict | None = None
+        self._batch_record_error_context: tuple[str, int] | None = None
         self.stream_name = stream_name
         self.logger.debug(
             "Initializing target sink for stream '%s'...",
@@ -559,10 +687,20 @@ class Sink(abc.ABC):  # noqa: PLR0904
             # on every record, so it's probably bad and should be moved up the stack.
             try:
                 self._validator.validate(record)
-            except InvalidRecord:
-                self.logger.exception("Record validation failed")
+            except InvalidRecord as ex:
+                if self._batch_record_error_context is not None:
+                    path, line_number = self._batch_record_error_context
+                    ex = InvalidRecord(
+                        f"{ex.error_message} (batch file '{path}', "
+                        f"line {line_number})",
+                        ex.record,
+                    )
+                    self.logger.exception("Record validation failed: %s", ex)
+                else:
+                    self.logger.exception("Record validation failed")
+
                 if self.fail_on_record_validation_exception:
-                    raise
+                    raise ex
 
         self._parse_timestamps_in_record(
             record=record,
@@ -763,44 +901,28 @@ class Sink(abc.ABC):  # noqa: PLR0904
         For JSONL-encoded batch files, expects raw JSON records (one per line),
         not Singer protocol messages.
 
+        The target only calls this method directly when no effective stream maps
+        or flattening apply to the stream. Otherwise, batch records are expanded
+        and processed as equivalent individual records. Overriding this method
+        while also configuring stream maps or flattening raises a
+        :class:`~singer_sdk.exceptions.StreamMapsNotSupportedError`.
+
         Args:
             encoding: The batch file encoding.
             files: The batch files to process.
 
         Raises:
             NotImplementedError: If the batch file encoding is not supported.
+            InvalidBatchFileError: If a batch file cannot be read or parsed.
         """
-        file: GzipFile | t.IO
         storage = self.batch_config.storage if self.batch_config else None
 
         for path in files:
-            head, tail = StorageTarget.split_url(path)
-            file_storage = storage or StorageTarget.from_url(head)
-
-            if encoding.format == BatchFileFormat.JSONL:
-                with file_storage.open(tail, mode="rb") as file:
-                    if encoding.compression == "gzip":
-                        with gzip_open(file) as context_file:
-                            context = {
-                                "records": [
-                                    deserialize_json(line) for line in context_file
-                                ]
-                            }
-                    else:
-                        context = {"records": [deserialize_json(line) for line in file]}
-                    self.record_counter_metric.increment(len(context["records"]))
-                    self.process_batch(context)
-            elif (
-                importlib.util.find_spec("pyarrow")
-                and encoding.format == BatchFileFormat.PARQUET
-            ):
-                import pyarrow.parquet as pq  # noqa: PLC0415
-
-                with file_storage.open(tail, mode="rb") as file:
-                    table = pq.read_table(file)
-                    context = {"records": table.to_pylist()}
-                    self.record_counter_metric.increment(len(context["records"]))
-                    self.process_batch(context)
-            else:
-                msg = f"Unsupported batch encoding format: {encoding.format}"
-                raise NotImplementedError(msg)
+            context = {
+                "records": [
+                    record
+                    for _, record in iter_batch_file_records(encoding, path, storage)
+                ]
+            }
+            self.record_counter_metric.increment(len(context["records"]))
+            self.process_batch(context)

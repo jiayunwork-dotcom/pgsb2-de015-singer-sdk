@@ -13,7 +13,10 @@ import warnings
 import click
 from joblib import Parallel, delayed, parallel_config
 
-from singer_sdk.exceptions import RecordsWithoutSchemaException
+from singer_sdk.exceptions import (
+    RecordsWithoutSchemaException,
+    StreamMapsNotSupportedError,
+)
 from singer_sdk.helpers._batch import BaseBatchFileEncoding
 from singer_sdk.helpers._compat import SingerSDKDeprecationWarning
 from singer_sdk.helpers.capabilities import (
@@ -27,7 +30,9 @@ from singer_sdk.helpers.capabilities import (
     TargetCapabilities,
 )
 from singer_sdk.io_base import SingerReader
+from singer_sdk.mapper import RemoveRecordTransform
 from singer_sdk.plugin_base import BaseSingerReader, _ConfigInput
+from singer_sdk.sinks.core import Sink, iter_batch_file_records
 
 if t.TYPE_CHECKING:
     from collections.abc import Iterable
@@ -35,9 +40,8 @@ if t.TYPE_CHECKING:
     from types import FrameType
 
     from singer_sdk.helpers.capabilities import CapabilitiesEnum
-    from singer_sdk.mapper import PluginMapper
+    from singer_sdk.mapper import PluginMapper, StreamMap
     from singer_sdk.singerlib.encoding.base import GenericSingerReader
-    from singer_sdk.sinks import Sink
     from singer_sdk.sql import SQLTarget  # noqa: F401
 
 _MAX_PARALLELISM = 8
@@ -321,33 +325,58 @@ class Target(BaseSingerReader, abc.ABC):
             self._assert_sink_exists(stream_map.stream_alias)
             sink = self.get_sink(stream_map.stream_alias, record=transformed_record)
             context = sink._get_context(transformed_record)  # noqa: SLF001
-            if sink.include_sdc_metadata_properties:
-                sink._add_sdc_metadata_to_record(  # noqa: SLF001
-                    transformed_record,
-                    message_dict,
-                    context,
-                )
-            else:
-                sink._remove_sdc_metadata_from_record(transformed_record)  # noqa: SLF001
-
-            sink._validate_and_parse(transformed_record)  # noqa: SLF001
-            transformed_record = sink.preprocess_record(transformed_record, context)
-            sink._singer_validate_message(transformed_record)  # noqa: SLF001
-
-            sink.tally_record_read()
-            sink.process_record(transformed_record, context)
-            sink.record_counter_metric.increment()
-            sink._after_process_record(context)  # noqa: SLF001
-
-            if sink.is_full:
-                self.logger.info(
-                    "Target sink for '%s' is full. Current size is '%s'. Draining...",
-                    sink.stream_name,
-                    sink.current_size,
-                )
-                self.drain_one(sink)
+            self._write_record(
+                sink,
+                transformed_record,
+                context,
+                message_dict,
+                stream_map.stream_alias,
+            )
 
         self._handle_max_record_age()
+
+    def _write_record(
+        self,
+        sink: Sink,
+        record: dict,
+        context: dict,
+        message_dict: dict,
+        stream_name: str,
+    ) -> None:
+        """Write a single (already mapped) record to its sink.
+
+        Args:
+            sink: The sink to write the record to.
+            record: The mapped record.
+            context: The record context.
+            message_dict: The originating Singer message.
+            stream_name: The name of the stream being written to.
+        """
+        if sink.include_sdc_metadata_properties:
+            sink._add_sdc_metadata_to_record(  # noqa: SLF001
+                record,
+                message_dict,
+                context,
+            )
+        else:
+            sink._remove_sdc_metadata_from_record(record)  # noqa: SLF001
+
+        sink._validate_and_parse(record)  # noqa: SLF001
+        record = sink.preprocess_record(record, context)
+        sink._singer_validate_message(record)  # noqa: SLF001
+
+        sink.tally_record_read()
+        sink.process_record(record, context)
+        sink.record_counter_metric.increment()
+        sink._after_process_record(context)  # noqa: SLF001
+
+        if sink.is_full:
+            self.logger.info(
+                "Target sink for '%s' is full. Current size is '%s'. Draining...",
+                stream_name,
+                sink.current_size,
+            )
+            self.drain_one(sink)
 
     def _process_schema_message(self, message_dict: dict) -> None:
         """Process a SCHEMA messages.
@@ -450,19 +479,128 @@ class Target(BaseSingerReader, abc.ABC):
     def _process_batch_message(self, message_dict: dict) -> None:
         """Handle the optional BATCH message extension.
 
+        Semantically, a ``BATCH`` message is equivalent to the ``RECORD`` messages
+        obtained by expanding each file listed in its manifest, in order and one line
+        at a time, at the position of the ``BATCH`` message. The expanded records use
+        the batch's ``stream``, and the ``time_extracted`` / ``version`` values of
+        the batch message (if any).
+
         Args:
             message_dict: TODO
         """
+        self._assert_line_requires(
+            message_dict,
+            requires={"stream", "encoding", "manifest"},
+        )
+
         stream_name = message_dict["stream"]
         encoding = BaseBatchFileEncoding.from_dict(message_dict["encoding"])
+        manifest = message_dict["manifest"]
 
-        for stream_map in self.mapper.stream_maps[stream_name]:
-            sink = self.get_sink(stream_map.stream_alias)
-            sink.process_batch_files(
-                encoding,
-                message_dict["manifest"],
-            )
+        if stream_name not in self.mapper.stream_maps:
+            # Raises RecordsWithoutSchemaException, exactly as for a RECORD message.
+            self._assert_sink_exists(stream_name)
+
+        stream_maps = self.mapper.stream_maps[stream_name]
+
+        # A stream that is entirely removed by its stream map produces no sink
+        # activity at all. Its files are never read.
+        active_maps = [
+            stream_map
+            for stream_map in stream_maps
+            if not isinstance(stream_map, RemoveRecordTransform)
+        ]
+        if not active_maps:
             self._handle_max_record_age()
+            return
+
+        any_map_changes_records = any(
+            stream_map.changes_records for stream_map in active_maps
+        )
+
+        # Check custom batch handlers before reading any file.
+        raw_file_maps: list[StreamMap] = []
+        expanded_maps: list[StreamMap] = []
+        for stream_map in active_maps:
+            self._assert_sink_exists(stream_map.stream_alias)
+            sink = self.get_sink(stream_map.stream_alias)
+            if not self._sink_overrides_process_batch_files(sink):
+                expanded_maps.append(stream_map)
+                continue
+
+            if any_map_changes_records:
+                msg = (
+                    f"The sink for stream '{stream_map.stream_alias}' overrides "
+                    "`process_batch_files`, so it cannot apply the configured "
+                    "stream maps or flattening to the records in a BATCH message. "
+                    "Disable stream maps and flattening for this stream, or remove "
+                    "the custom `process_batch_files` implementation."
+                )
+                raise StreamMapsNotSupportedError(msg)
+
+            raw_file_maps.append(stream_map)
+
+        # With no effective stream maps or flattening, custom `process_batch_files`
+        # implementations receive the raw files, exactly as before.
+        for stream_map in raw_file_maps:
+            sink = self.get_sink(stream_map.stream_alias)
+            sink.process_batch_files(encoding, manifest)
+
+        if not expanded_maps:
+            self._handle_max_record_age()
+            return
+
+        # Expand the batch into the equivalent RECORD sequence, in manifest order
+        # and then line order within each file.
+        batch_config = self.get_sink(expanded_maps[0].stream_alias).batch_config
+        storage = batch_config.storage if batch_config else None
+
+        for path in manifest:
+            for line_number, record in iter_batch_file_records(
+                encoding,
+                path,
+                storage,
+            ):
+                for stream_map in expanded_maps:
+                    raw_record = copy.copy(record)
+                    transformed_record = stream_map.transform(raw_record)
+                    if transformed_record is None:
+                        continue
+
+                    self._assert_sink_exists(stream_map.stream_alias)
+                    sink = self.get_sink(
+                        stream_map.stream_alias,
+                        record=transformed_record,
+                    )
+                    context = sink._get_context(transformed_record)  # noqa: SLF001
+                    sink._batch_record_error_context = (  # noqa: SLF001
+                        path,
+                        line_number,
+                    )
+                    try:
+                        self._write_record(
+                            sink,
+                            transformed_record,
+                            context,
+                            message_dict,
+                            stream_map.stream_alias,
+                        )
+                    finally:
+                        sink._batch_record_error_context = None  # noqa: SLF001
+
+                self._handle_max_record_age()
+
+    @staticmethod
+    def _sink_overrides_process_batch_files(sink: Sink) -> bool:
+        """Whether the sink provides its own batch file processing.
+
+        Args:
+            sink: The sink to check.
+
+        Returns:
+            True if ``process_batch_files`` is overridden by the sink class.
+        """
+        return type(sink).process_batch_files is not Sink.process_batch_files
 
     # Sink drain methods
 

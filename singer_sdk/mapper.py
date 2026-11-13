@@ -117,6 +117,19 @@ class StreamMap(abc.ABC):
             and self.flattening_options.max_level > 0
         )
 
+    @property
+    def changes_records(self) -> bool:
+        """Whether this stream map can change (or filter) the records it receives.
+
+        This is used to determine whether a ``BATCH`` message can be handed to a
+        sink's :meth:`~singer_sdk.Sink.process_batch_files` implementation as-is, or
+        whether it must instead be expanded into equivalent ``RECORD`` messages first.
+
+        Returns:
+            True if records may be changed or removed by this map.
+        """
+        return True
+
     def flatten_record(self, record: dict) -> dict:
         """If flattening is enabled, flatten a record and return the result.
 
@@ -198,6 +211,15 @@ class DefaultStreamMap(StreamMap):
 class RemoveRecordTransform(DefaultStreamMap):
     """Default mapper which simply excludes any records."""
 
+    @property
+    def changes_records(self) -> bool:
+        """Whether this stream map can change the records it receives.
+
+        Returns:
+            Always True: all records are removed.
+        """
+        return True
+
     def transform(self, record: dict) -> None:  # noqa: PLR6301
         """Return None (always exclude).
 
@@ -220,6 +242,17 @@ class RemoveRecordTransform(DefaultStreamMap):
 
 class SameRecordTransform(DefaultStreamMap):
     """Default mapper which simply returns the original records."""
+
+    @property
+    def changes_records(self) -> bool:
+        """Whether this stream map can change the records it receives.
+
+        A pass-through map only changes records when flattening is enabled.
+
+        Returns:
+            True if flattening is enabled, otherwise False.
+        """
+        return self.flattening_enabled
 
     def transform(self, record: dict) -> dict | None:
         """Return original record unchanged.
@@ -313,6 +346,20 @@ class _MapperEval(simpleeval.EvalWithCompoundTypes):
 class CustomStreamMap(StreamMap):
     """Defines transformation logic for a singer stream map."""
 
+    @property
+    def changes_records(self) -> bool:
+        """Whether this stream map can change (or filter) the records it receives.
+
+        An empty map definition is a pure pass-through. Every defined operator
+        (``__filter__``, ``__alias__``, ``__source__``, ``__else__``,
+        ``__key_properties__``, property transforms/removals) can affect the output,
+        so any non-empty definition is considered record-changing.
+
+        Returns:
+            True if this map has any operators defined.
+        """
+        return self._record_changes
+
     def __init__(
         self,
         stream_alias: str,
@@ -347,6 +394,7 @@ class CustomStreamMap(StreamMap):
         self.map_config = map_config
         self.faker_config = faker_config
         self.stream_name = stream_name
+        self._record_changes = bool(map_transform)
 
         self._transform_fn: t.Callable[[dict], dict | None]
         self._filter_fn: t.Callable[[dict], bool]

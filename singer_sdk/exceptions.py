@@ -38,6 +38,7 @@ __all__ = [  # noqa: RUF022
     "InvalidStreamSortException",
     "MissingKeyPropertiesError",
     "RecordsWithoutSchemaException",
+    "StreamMapsNotSupportedError",
     "TapStreamConnectionFailure",
     "TooManyRecordsException",
     # Sync — retriable
@@ -49,6 +50,7 @@ __all__ = [  # noqa: RUF022
     "InvalidRecord",
     # Sync — data quality
     "DataError",
+    "InvalidBatchFileError",
     "InvalidJSONSchema",
     # Lifecycle signals
     "SyncLifecycleSignal",
@@ -209,6 +211,10 @@ class RecordsWithoutSchemaException(FatalSyncError):
     """Raised if a target receives RECORD messages prior to a SCHEMA message."""
 
 
+class StreamMapsNotSupportedError(FatalSyncError):
+    """Raised when stream maps cannot be applied to a custom batch file handler."""
+
+
 class TapStreamConnectionFailure(FatalSyncError):
     """Exception to raise when stream connection fails or stream is disconnected."""
 
@@ -275,6 +281,34 @@ class InvalidRecord(SkippableSyncError):
 
 class DataError(SyncError):
     """Raised when a data quality violation is detected during sync."""
+
+
+class InvalidBatchFileError(DataError):
+    """Raised when a batch file cannot be read or parsed.
+
+    Attributes:
+        path: The URL or path of the offending batch file, if known.
+        line_number: The 1-based line (or row) number of the offending record, if
+            known.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: str | None = None,
+        line_number: int | None = None,
+    ) -> None:
+        """Initialize an InvalidBatchFileError.
+
+        Args:
+            message: A message describing the error.
+            path: The URL or path of the offending batch file.
+            line_number: The 1-based line (or row) number of the offending record.
+        """
+        super().__init__(message)
+        self.path = path
+        self.line_number = line_number
 
 
 class InvalidJSONSchema(DataError):
