@@ -51,7 +51,7 @@ jobs:
         fetch-depth: 0
         persist-credentials: false
 
-    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
 
     - name: Bump version
       id: cz-bump
@@ -73,7 +73,7 @@ jobs:
     - name: Draft Release
       if: ${{ github.event.inputs.dry_run == 'false' }}
       id: draft-release
-      uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
       with:
         draft: true
         body_path: _changelog_fragment.md
@@ -87,7 +87,7 @@ jobs:
 
     - name: Create Pull Request
       if: ${{ github.event.inputs.dry_run == 'false' }}
-      uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+      uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v8.1.2
       id: create-pull-request
       with:
         token: ${{ secrets.MELTYBOT_GITHUB_AUTH_TOKEN }}
