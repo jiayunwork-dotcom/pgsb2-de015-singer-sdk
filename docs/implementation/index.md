@@ -12,6 +12,8 @@ record_metadata
 metrics
 logging
 state
+graceful_shutdown
+graceful_shutdown_verification
 at_least_once
 errors/index
 ```

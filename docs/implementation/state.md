@@ -60,6 +60,11 @@ tap | target | tail -n 1 > state.json
 
 The last state payload represents the last successfully committed checkpoint, providing fault tolerance if the sync is interrupted.
 
+Targets write a `STATE` payload only after the writes it covers have been committed.
+If a batch fails, no payload that covers that failed write is written, and the
+process exits non-zero. See [Graceful Target Shutdown](./graceful_shutdown.md) for
+the full ordering guarantees on `SIGTERM`/`SIGINT` and on commit failures.
+
 ## Backwards Compatibility
 
 While the exact specification of STATE messages may change between versions, it is

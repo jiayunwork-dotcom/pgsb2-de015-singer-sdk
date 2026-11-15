@@ -29,6 +29,7 @@ from singer_sdk.exceptions import ConfigValidationError, MapperNotInitialized
 from singer_sdk.helpers._classproperty import classproperty
 from singer_sdk.helpers._compat import SingerSDKDeprecationWarning, warn_python_eol
 from singer_sdk.helpers._packaging import SDK_PACKAGE_NAME, get_package_version
+from singer_sdk.helpers._termination import TerminationRequested
 from singer_sdk.helpers._util import read_json_file
 from singer_sdk.helpers.capabilities import (
     FLATTENING_CONFIG,
@@ -764,7 +765,23 @@ class BaseSingerReader(BaseSingerIO, abc.ABC):
         Args:
             file_input: Readable stream of messages. Defaults to standard in.
         """
-        counter = self.process_lines(file_input)
+        if self._should_stop_before_reading():
+            self._on_input_interrupted()
+            return
+
+        try:
+            counter = self.process_lines(file_input)
+        except TerminationRequested:
+            self._on_input_interrupted()
+            return
+        except BaseException as ex:
+            self._on_processing_error(ex)
+            raise
+
+        if self._should_stop_before_endofpipe():
+            self._on_input_interrupted()
+            return
+
         line_count = sum(counter.values())
 
         self.logger.info(
@@ -790,16 +807,59 @@ class BaseSingerReader(BaseSingerIO, abc.ABC):
         Returns:
             A counter object for the processed lines.
         """
+        callbacks: dict[str, t.Callable[[dict], None]] = {
+            SingerMessageType.SCHEMA: self._process_schema_message,
+            SingerMessageType.RECORD: self._process_record_message,
+            SingerMessageType.STATE: self._process_state_message,
+            SingerMessageType.ACTIVATE_VERSION: (
+                self._process_activate_version_message
+            ),
+            SingerMessageType.BATCH: self._process_batch_message,
+        }
         return self.message_reader.process_lines(
-            file_input,
-            callbacks={
-                SingerMessageType.SCHEMA: self._process_schema_message,
-                SingerMessageType.RECORD: self._process_record_message,
-                SingerMessageType.STATE: self._process_state_message,
-                SingerMessageType.ACTIVATE_VERSION: self._process_activate_version_message,  # noqa: E501
-                SingerMessageType.BATCH: self._process_batch_message,
-            },
+            self._prepare_input(file_input),
+            callbacks=callbacks,
         )
+
+    def _prepare_input(  # noqa: PLR6301
+        self,
+        file_input: t.IO[str] | None,
+    ) -> t.IO[str] | None:
+        """Allow a subclass to wrap the input stream before it is read.
+
+        Args:
+            file_input: Readable stream of messages, or ``None`` for the default.
+
+        Returns:
+            The stream that will actually be read.
+        """
+        return file_input
+
+    def _should_stop_before_reading(self) -> bool:  # noqa: PLR6301
+        """Whether reading should be skipped and termination handling run instead.
+
+        Returns:
+            True to skip reading input.
+        """
+        return False
+
+    def _should_stop_before_endofpipe(self) -> bool:  # noqa: PLR6301
+        """Whether the end-of-pipe drain should be replaced by termination handling.
+
+        Returns:
+            True to skip the normal end-of-pipe drain.
+        """
+        return False
+
+    def _on_input_interrupted(self) -> None:
+        """Handle an interrupted read. Subclasses may perform graceful shutdown."""
+
+    def _on_processing_error(self, error: BaseException) -> None:
+        """Handle an error raised while processing input.
+
+        Args:
+            error: The error that is about to propagate.
+        """
 
     def process_endofpipe(self) -> None:
         """Process end of pipe."""

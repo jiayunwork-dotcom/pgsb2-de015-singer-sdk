@@ -15,6 +15,11 @@ This is the default, where only one sink is active for each incoming stream name
 
 _Note: Targets write state payloads to stdout whenever sinks drain. See [Target State Output](implementation/state.md#target-state-output) for details on capturing the final state._
 
+_Note: A sink is never cleaned up while one of its `process_batch` calls is in
+flight, and each sink is cleaned up at most once. On `SIGTERM`/`SIGINT`, every sink
+— including one retired by a schema change — must finish its commits before the
+process exits successfully. See [Graceful Target Shutdown](implementation/graceful_shutdown.md)._
+
 ### Database sink example
 
 A database-type target where each stream will land in a dedicated table. Each sink is of the same class, with a different target table based on stream_name.

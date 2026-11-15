@@ -6,12 +6,14 @@ import abc
 import copy
 import json
 import sys
+import threading
 import time
 import typing as t
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 
 import click
-from joblib import Parallel, delayed, parallel_config
 
 from singer_sdk.exceptions import (
     RecordsWithoutSchemaException,
@@ -19,6 +21,7 @@ from singer_sdk.exceptions import (
 )
 from singer_sdk.helpers._batch import BaseBatchFileEncoding
 from singer_sdk.helpers._compat import SingerSDKDeprecationWarning
+from singer_sdk.helpers._termination import TerminationRequested
 from singer_sdk.helpers.capabilities import (
     ACTIVATE_VERSION_CONFIG,
     ADD_RECORD_METADATA_CONFIG,
@@ -35,7 +38,6 @@ from singer_sdk.plugin_base import BaseSingerReader, _ConfigInput
 from singer_sdk.sinks.core import Sink, iter_batch_file_records
 
 if t.TYPE_CHECKING:
-    from collections.abc import Iterable
     from pathlib import PurePath
     from types import FrameType
 
@@ -45,6 +47,69 @@ if t.TYPE_CHECKING:
     from singer_sdk.sql import SQLTarget  # noqa: F401
 
 _MAX_PARALLELISM = 8
+
+
+class _InterruptibleInput:
+    """An iterator over input lines that yields to a pending shutdown request.
+
+    A termination signal can only interrupt Python code between bytecodes; it cannot
+    interrupt a thread blocked in ``read(2)``. Before each blocking read the target
+    marks the read as interruptible, so a signal handler can raise
+    :class:`~singer_sdk.helpers._termination.TerminationRequested` and unwind to the
+    input boundary. The mark is cleared as soon as the read returns.
+    """
+
+    def __init__(self, target: Target, lines: t.Iterator[str]) -> None:
+        """Initialize the wrapper.
+
+        Args:
+            target: The target whose shutdown state is checked.
+            lines: The underlying line iterator.
+        """
+        self._target = target
+        self._lines = lines
+
+    def __iter__(self) -> _InterruptibleInput:
+        """Return the iterator.
+
+        Returns:
+            This wrapper.
+        """
+        return self
+
+    def __next__(self) -> str:
+        """Return the next line unless a termination was requested.
+
+        Returns:
+            The next input line.
+
+        Raises:
+            TerminationRequested: If a termination request is already pending.
+        """
+        target = self._target
+        if target._shutdown_requested:  # noqa: SLF001
+            raise TerminationRequested(target._shutdown_signum)  # noqa: SLF001
+
+        target._interruptible = True  # noqa: SLF001
+        try:
+            # A signal that arrived between the check above and this point was
+            # recorded by the handler but could not raise. Re-check now that the
+            # read is marked interruptible so the request is never lost.
+            if target._shutdown_requested:  # noqa: SLF001
+                raise TerminationRequested(target._shutdown_signum)  # noqa: SLF001
+            line = next(self._lines)
+        finally:
+            target._interruptible = False  # noqa: SLF001
+
+        if target._shutdown_requested:  # noqa: SLF001
+            raise TerminationRequested(target._shutdown_signum)  # noqa: SLF001
+        return line
+
+    def close(self) -> None:
+        """Close the underlying stream, if it is closeable."""
+        close = getattr(self._lines, "close", None)
+        if close is not None:
+            close()
 
 
 class Target(BaseSingerReader, abc.ABC):
@@ -96,6 +161,16 @@ class Target(BaseSingerReader, abc.ABC):
             setup_mapper: True to setup the mapper. Set to False if you want to
             message_reader: The message reader to use for reading messages.
         """
+        # Termination bookkeeping must exist before the base class installs its
+        # signal handlers: a signal may arrive while the constructor is still
+        # running. The signal handler only ever records the request, so these
+        # attributes are the only state it touches.
+        self._shutdown_requested: bool = False
+        self._shutdown_signum: int | None = None
+        self._shutdown_completed: bool = False
+        self._shutdown_lock = threading.RLock()
+        self._interruptible: bool = False
+
         super().__init__(
             config=config,
             parse_env_config=parse_env_config,
@@ -108,6 +183,24 @@ class Target(BaseSingerReader, abc.ABC):
         self._sinks_active: dict[str, Sink] = {}
         self._sinks_to_clear: list[Sink] = []
         self._max_parallelism: int | None = _MAX_PARALLELISM
+
+        # Registry of every sink this target ever created, in creation order. It is
+        # used to decide whether a shutdown has waited for all in-flight writes and
+        # to guarantee each sink is cleaned up at most once, including sinks left
+        # behind by a schema change.
+        self._sinks_registry: list[Sink] = []
+
+        # Serializes drains of an individual sink so the same in-flight batch can
+        # never be submitted twice, and records sinks whose batch permanently
+        # failed so they are never retried.
+        self._sink_drain_locks: dict[int, threading.Lock] = {}
+        self._sink_drain_locks_guard = threading.Lock()
+        self._failed_sinks: set[int] = set()
+        self._cleaned_up_sinks: set[int] = set()
+
+        # The first commit error, if any. While set, no progress can be acknowledged
+        # because a state message would cover records that were never committed.
+        self._commit_error: BaseException | None = None
 
         # Approximated for max record age enforcement
         self._last_full_drain_at: float = time.time()
@@ -266,8 +359,33 @@ class Target(BaseSingerReader, abc.ABC):
             self.logger.error("Error initializing target sink '%s'", self.name)  # noqa: TRY400
             raise
 
+        self._register_sink(sink)
         self._sinks_active[stream_name] = sink
         return sink
+
+    def _register_sink(self, sink: Sink) -> None:
+        """Record a newly created sink in the target's sink registry.
+
+        The registry keeps every sink alive for the lifetime of the target so that
+        a shutdown can reason about all in-flight writes, including sinks that were
+        already retired by a schema change.
+
+        Args:
+            sink: The new sink.
+        """
+        self._sinks_registry.append(sink)
+
+    def _drain_lock_for(self, sink: Sink) -> threading.Lock:
+        """Return the lock that serializes drains of a sink.
+
+        Args:
+            sink: The sink to lock.
+
+        Returns:
+            The sink's drain lock.
+        """
+        with self._sink_drain_locks_guard:
+            return self._sink_drain_locks.setdefault(id(sink), threading.Lock())
 
     def _assert_sink_exists(self, stream_name: str) -> None:
         """Raise a RecordsWithoutSchemaException exception if stream doesn't exist.
@@ -301,7 +419,66 @@ class Target(BaseSingerReader, abc.ABC):
 
     def process_endofpipe(self) -> None:
         """Called after all input lines have been read."""
+        if self._shutdown_requested:
+            self._graceful_shutdown()
+            return
+
         self.drain_all(is_endofpipe=True)
+
+    # Input interruption hooks (see ``BaseSingerReader.listen``)
+
+    def _prepare_input(self, file_input: t.IO[str] | None) -> t.IO[str] | None:
+        """Wrap the input so a termination signal can interrupt a blocking read.
+
+        Args:
+            file_input: Readable stream of messages, or ``None`` for the default.
+
+        Returns:
+            A stream that checks for a pending termination request before every
+            line and marks reads as interruptible.
+        """
+        stream = (
+            file_input if file_input is not None else self.message_reader.default_input
+        )
+        return t.cast("t.IO[str]", _InterruptibleInput(self, iter(stream)))
+
+    def _should_stop_before_reading(self) -> bool:
+        """Whether a termination request is already pending.
+
+        Returns:
+            True if the target should not read any input.
+        """
+        return self._shutdown_requested
+
+    def _should_stop_before_endofpipe(self) -> bool:
+        """Whether a termination request arrived while input was being read.
+
+        Returns:
+            True if the normal end-of-pipe drain should be replaced by a
+            graceful shutdown.
+        """
+        return self._shutdown_requested
+
+    def _on_input_interrupted(self) -> None:
+        """Run a graceful shutdown after a termination request interrupted reading."""
+        self._graceful_shutdown()
+
+    def _on_processing_error(self, error: BaseException) -> None:
+        """Attempt sink cleanup after a commit failure aborts input processing.
+
+        A failed commit must not prevent cleanup later in the stream, and a cleanup
+        failure must never replace the original error. Cleanup is only attempted for
+        commit failures; other input errors keep their previous behavior.
+
+        Args:
+            error: The error that is about to propagate.
+        """
+        _ = error
+        if self._commit_error is None:
+            return
+        cleanup_errors = self._clean_up_sinks(list(self._sinks_registry))
+        if cleanup_errors:
+            self._log_cleanup_error(cleanup_errors[0])
 
     def _process_record_message(self, message_dict: dict) -> None:
         """Process a RECORD message.
@@ -514,6 +691,98 @@ class Target(BaseSingerReader, abc.ABC):
             self._handle_max_record_age()
             return
 
+        raw_file_maps, expanded_maps = self._classify_batch_maps(active_maps)
+
+        # With no effective stream maps or flattening, custom `process_batch_files`
+        # implementations receive the raw files, exactly as before.
+        for stream_map in raw_file_maps:
+            sink = self.get_sink(stream_map.stream_alias)
+            sink.process_batch_files(encoding, manifest)
+
+        if not expanded_maps:
+            self._handle_max_record_age()
+            return
+
+        # Expand the batch into the equivalent RECORD sequence, in manifest order
+        # and then line order within each file.
+        batch_config = self.get_sink(expanded_maps[0].stream_alias).batch_config
+        storage = batch_config.storage if batch_config else None
+
+        for path in manifest:
+            for line_number, record in iter_batch_file_records(
+                encoding,
+                path,
+                storage,
+            ):
+                if self._shutdown_requested:
+                    # No new records are accepted once shutdown has begun.
+                    return
+                self._write_expanded_records(
+                    expanded_maps,
+                    record,
+                    message_dict,
+                    path,
+                    line_number,
+                )
+                self._handle_max_record_age()
+
+    def _write_expanded_records(
+        self,
+        stream_maps: list[StreamMap],
+        record: dict,
+        message_dict: dict,
+        path: str,
+        line_number: int,
+    ) -> None:
+        """Write one batch record through each applicable stream map.
+
+        Args:
+            stream_maps: The stream maps that expand into sinks.
+            record: The raw record read from the batch file.
+            message_dict: The originating BATCH message.
+            path: The batch file the record came from.
+            line_number: The record's 1-based position in the batch file.
+        """
+        for stream_map in stream_maps:
+            raw_record = copy.copy(record)
+            transformed_record = stream_map.transform(raw_record)
+            if transformed_record is None:
+                continue
+
+            self._assert_sink_exists(stream_map.stream_alias)
+            sink = self.get_sink(
+                stream_map.stream_alias,
+                record=transformed_record,
+            )
+            context = sink._get_context(transformed_record)  # noqa: SLF001
+            sink._batch_record_error_context = (path, line_number)  # noqa: SLF001
+            try:
+                self._write_record(
+                    sink,
+                    transformed_record,
+                    context,
+                    message_dict,
+                    stream_map.stream_alias,
+                )
+            finally:
+                sink._batch_record_error_context = None  # noqa: SLF001
+
+    def _classify_batch_maps(
+        self,
+        active_maps: list[StreamMap],
+    ) -> tuple[list[StreamMap], list[StreamMap]]:
+        """Split batch stream maps into raw-file and expanded-record groups.
+
+        Args:
+            active_maps: Stream maps that were not fully removed.
+
+        Returns:
+            A ``(raw_file_maps, expanded_maps)`` pair.
+
+        Raises:
+            StreamMapsNotSupportedError: If a sink overrides ``process_batch_files``
+                while stream maps or flattening are active.
+        """
         any_map_changes_records = any(
             stream_map.changes_records for stream_map in active_maps
         )
@@ -540,55 +809,7 @@ class Target(BaseSingerReader, abc.ABC):
 
             raw_file_maps.append(stream_map)
 
-        # With no effective stream maps or flattening, custom `process_batch_files`
-        # implementations receive the raw files, exactly as before.
-        for stream_map in raw_file_maps:
-            sink = self.get_sink(stream_map.stream_alias)
-            sink.process_batch_files(encoding, manifest)
-
-        if not expanded_maps:
-            self._handle_max_record_age()
-            return
-
-        # Expand the batch into the equivalent RECORD sequence, in manifest order
-        # and then line order within each file.
-        batch_config = self.get_sink(expanded_maps[0].stream_alias).batch_config
-        storage = batch_config.storage if batch_config else None
-
-        for path in manifest:
-            for line_number, record in iter_batch_file_records(
-                encoding,
-                path,
-                storage,
-            ):
-                for stream_map in expanded_maps:
-                    raw_record = copy.copy(record)
-                    transformed_record = stream_map.transform(raw_record)
-                    if transformed_record is None:
-                        continue
-
-                    self._assert_sink_exists(stream_map.stream_alias)
-                    sink = self.get_sink(
-                        stream_map.stream_alias,
-                        record=transformed_record,
-                    )
-                    context = sink._get_context(transformed_record)  # noqa: SLF001
-                    sink._batch_record_error_context = (  # noqa: SLF001
-                        path,
-                        line_number,
-                    )
-                    try:
-                        self._write_record(
-                            sink,
-                            transformed_record,
-                            context,
-                            message_dict,
-                            stream_map.stream_alias,
-                        )
-                    finally:
-                        sink._batch_record_error_context = None  # noqa: SLF001
-
-                self._handle_max_record_age()
+        return raw_file_maps, expanded_maps
 
     @staticmethod
     def _sink_overrides_process_batch_files(sink: Sink) -> bool:
@@ -610,53 +831,252 @@ class Target(BaseSingerReader, abc.ABC):
 
         This method is internal to the SDK and should not need to be overridden.
 
+        All sinks are attempted even if some fail. The latest state is emitted only
+        after every commit succeeded.
+
         Args:
             is_endofpipe: This is called after the target instance has finished
-                listening to the stdin.
+                listening to the stdin. Every sink is cleaned up afterwards.
+
         """
-        self._drain_all(self._sinks_to_clear, 1)
-        if is_endofpipe:
-            for sink in self._sinks_to_clear:
-                sink.clean_up()
-        self._sinks_to_clear = []
-        self._drain_all(self._sinks_active.values(), self.max_parallelism)
-        if is_endofpipe:
-            for sink in self._sinks_active.values():
-                sink.clean_up()
-
-        if self._latest_state:
-            self._write_state_message(copy.deepcopy(self._latest_state))
-
+        self._drain_pending(clean_up=is_endofpipe)
         self._reset_max_record_age()
 
     @t.final
-    def drain_one(self, sink: Sink) -> None:  # noqa: PLR6301
+    def drain_one(self, sink: Sink) -> None:
         """Drain a specific sink.
 
         This method is internal to the SDK and should not need to be overridden.
 
         Args:
             sink: Sink to be drained.
+
         """
-        if sink.current_size == 0:
+        self._drain_sink(sink)
+
+    def _drain_sink(self, sink: Sink) -> None:
+        """Drain one sink, serializing concurrent requests to drain the same sink.
+
+        At most one drain per sink is in flight at a time. A sink whose batch failed
+        is never drained again, so a failed in-flight batch can never be re-submitted.
+
+        Args:
+            sink: Sink to be drained.
+
+        """
+        if id(sink) in self._failed_sinks or sink.current_size == 0:
             return
 
-        draining_status = sink.start_drain()
-        with sink.batch_processing_timer:
-            sink.process_batch(draining_status)
-        sink.mark_drained()
+        lock = self._drain_lock_for(sink)
+        with lock:
+            if id(sink) in self._failed_sinks or sink.current_size == 0:
+                return
 
-    def _drain_all(self, sink_list: Iterable[Sink], parallelism: int) -> None:
-        if parallelism == 1:
-            for sink in sink_list:
-                self.drain_one(sink)
-            return
+            draining_status = sink.start_drain()
+            try:
+                with sink.batch_processing_timer:
+                    sink.process_batch(draining_status)
+            except BaseException as ex:
+                self._failed_sinks.add(id(sink))
+                if self._commit_error is None:
+                    self._commit_error = ex
+                raise
+            sink.mark_drained()
 
-        def _drain_sink(sink: Sink) -> None:
-            self.drain_one(sink)
+    def _drain_pending(
+        self,
+        *,
+        clean_up: bool,
+    ) -> None:
+        """Drain every pending sink, then optionally clean every sink up.
 
-        with parallel_config(backend="threading", n_jobs=parallelism):
-            Parallel()(delayed(_drain_sink)(sink=sink) for sink in sink_list)
+        All sinks are attempted even if some fail, so a failure in one stream does
+        not hide progress or cleanup opportunities in another. Cleanup errors never
+        replace a commit error. State is written only if every commit so far has
+        succeeded.
+
+        Args:
+            clean_up: Whether to clean up every sink after draining. Cleanup is also
+                attempted after a commit failure when a termination was requested.
+
+        """
+        sinks_to_clear = list(self._sinks_to_clear)
+        self._sinks_to_clear = []
+        active_sinks = list(self._sinks_active.values())
+
+        # Sinks retired by a schema change drain first, then current sinks. Every
+        # sink ever created is still in the registry, so a retired sink that was
+        # already drained is not drained again, but is still cleaned up exactly once.
+        commit_errors = self._drain_sinks(sinks_to_clear, 1)
+        commit_errors.extend(
+            self._drain_sinks(active_sinks, self.max_parallelism),
+        )
+
+        if clean_up:
+            # Safety net for targets that override ``get_sink`` and keep sinks
+            # outside the two standard groups. Every sink call has returned at this
+            # point, so this can neither resubmit an in-flight batch nor race it.
+            drained = {id(sink) for sink in (*sinks_to_clear, *active_sinks)}
+            remaining = [
+                sink
+                for sink in self._sinks_registry
+                if id(sink) not in drained and sink.current_size > 0
+            ]
+            commit_errors.extend(self._drain_sinks(remaining, 1))
+
+        cleanup_errors: list[BaseException] = []
+        if clean_up or (commit_errors and self._shutdown_requested):
+            cleanup_errors = self._clean_up_sinks(list(self._sinks_registry))
+
+        # Both error kinds are logged so a cleanup error can never hide the commit
+        # diagnostic, and a cleanup-only failure is still reported.
+        if self._commit_error is not None:
+            self._log_drain_error(self._commit_error)
+        if cleanup_errors:
+            self._log_cleanup_error(cleanup_errors[0])
+
+        if self._commit_error is not None:
+            raise self._commit_error
+
+        # Every commit succeeded. The latest state can now be safely acknowledged.
+        if self._latest_state:
+            self._write_state_message(copy.deepcopy(self._latest_state))
+
+        if cleanup_errors:
+            raise cleanup_errors[0]
+
+    def _drain_sinks(
+        self,
+        sinks: list[Sink],
+        parallelism: int,
+    ) -> list[BaseException]:
+        """Drain a group of sinks, returning commit errors in sink order.
+
+        Every sink in the group is attempted before errors are returned, and a batch
+        that is already in flight is always awaited rather than submitted again.
+
+        Args:
+            sinks: The sinks to drain.
+            parallelism: Maximum number of sinks to drain concurrently.
+
+        Returns:
+            The commit errors raised by this call, in sink order.
+        """
+        if not sinks:
+            return []
+
+        if parallelism <= 1 or len(sinks) == 1:
+            return self._drain_serially(sinks)
+
+        results: list[BaseException | None] = [None] * len(sinks)
+        workers = min(parallelism, len(sinks))
+
+        def _run(index: int, sink: Sink) -> None:
+            try:
+                self._drain_sink(sink)
+            except BaseException as ex:  # noqa: BLE001
+                results[index] = ex
+
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = [
+                executor.submit(_run, index, sink) for index, sink in enumerate(sinks)
+            ]
+            # Wait in short slices instead of one long blocking join. A Python
+            # signal handler can only run on the main thread when it returns to the
+            # interpreter, so a single blocking join would defer termination
+            # handling until an unrelated batch finished.
+            pending = set(futures)
+            while pending:
+                _done, pending = wait_futures(pending, timeout=0.05)
+        finally:
+            executor.shutdown(wait=True)
+
+        return [error for error in results if error is not None]
+
+    def _drain_serially(self, sinks: list[Sink]) -> list[BaseException]:
+        """Drain sinks one at a time, collecting errors.
+
+        Args:
+            sinks: The sinks to drain.
+
+        Returns:
+            The commit errors raised by this call, in sink order.
+        """
+        errors: list[BaseException] = []
+        for sink in sinks:
+            error = self._drain_sink_collecting(sink)
+            if error is not None:
+                errors.append(error)
+        return errors
+
+    def _drain_sink_collecting(self, sink: Sink) -> BaseException | None:
+        """Drain one sink, returning any error instead of raising it.
+
+        Args:
+            sink: The sink to drain.
+
+        Returns:
+            The commit error, if the batch failed.
+        """
+        try:
+            self._drain_sink(sink)
+        except BaseException as ex:  # noqa: BLE001
+            return ex
+        return None
+
+    def _clean_up_sinks(self, sinks: list[Sink]) -> list[BaseException]:
+        """Clean up each sink at most once, collecting errors.
+
+        Cleanup runs only after every drain attempt has returned, so a sink is never
+        cleaned while one of its batches is still in flight.
+
+        Args:
+            sinks: The sinks to clean up.
+
+        Returns:
+            The cleanup errors, in sink order.
+        """
+        errors: list[BaseException] = []
+        for sink in sinks:
+            error = self._clean_up_sink(sink)
+            if error is not None:
+                errors.append(error)
+        return errors
+
+    def _clean_up_sink(self, sink: Sink) -> BaseException | None:
+        """Clean up one sink at most once.
+
+        Args:
+            sink: The sink to clean up.
+
+        Returns:
+            The cleanup error, if cleanup failed.
+        """
+        if id(sink) in self._cleaned_up_sinks:
+            return None
+        self._cleaned_up_sinks.add(id(sink))
+        try:
+            sink.clean_up()
+        except BaseException as ex:  # noqa: BLE001
+            return ex
+        return None
+
+    def _log_drain_error(self, error: BaseException) -> None:
+        """Log a drain error without hiding the original exception.
+
+        Args:
+            error: The commit error.
+        """
+        self.logger.error("Error committing a batch: %s", error)
+
+    def _log_cleanup_error(self, error: BaseException) -> None:
+        """Log a cleanup error without hiding the original exception.
+
+        Args:
+            error: The cleanup error.
+        """
+        self.logger.error("Error cleaning up a sink: %s", error)
 
     def _write_state_message(self, state: dict) -> None:
         """Emit the stream's latest state.
@@ -669,27 +1089,70 @@ class Target(BaseSingerReader, abc.ABC):
         sys.stdout.write(f"{state_json}\n")
         sys.stdout.flush()
 
-    # CLI handler
+    # Graceful termination
 
-    def _handle_termination(  # pragma: no cover
-        self,
-        signum: int,
-        frame: FrameType | None,
-    ) -> None:
-        """Handle termination signals.
+    def _graceful_shutdown(self) -> None:
+        """Complete a safe exit after a termination signal.
+
+        Every sink whose batch is already in flight is awaited before any cleanup
+        starts; no new input is read. Sinks are cleaned up once, even those retired
+        by a schema change. The latest state is emitted only when every commit
+        succeeded. The process exits with status 0 on success and a non-zero status
+        if any commit or cleanup failed.
+
+        Repeated signals during shutdown are ignored so they cannot double-submit,
+        double-confirm, or double-clean.
+        """
+        with self._shutdown_lock:
+            if self._shutdown_completed:
+                return
+
+            if self._shutdown_signum is not None:
+                self.logger.info(
+                    "Received termination signal %d, shutting down gracefully...",
+                    self._shutdown_signum,
+                )
+            else:
+                self.logger.info("Shutting down gracefully...")
+
+            try:
+                self._drain_pending(clean_up=True)
+            except BaseException:
+                self._shutdown_completed = True
+                self.logger.exception("Graceful shutdown failed")
+                sys.exit(1)
+
+            self._shutdown_completed = True
+
+    def _handle_termination(self, signum: int, frame: FrameType | None) -> None:
+        """Handle termination signals without doing sink work in the handler.
+
+        The handler only records the request. If the target is blocked reading
+        standard input, an internal exception is raised to unwind to the input
+        boundary, where the graceful shutdown runs on the normal call stack. If a
+        batch is in flight or the target is in its end-of-pipe phase, the running
+        call notices the request and completes shutdown itself.
 
         Args:
             signum: Signal number.
             frame: Frame object.
+
+        Raises:
+            TerminationRequested: To unwind a blocked read when the target is
+                waiting for input.
         """
-        self.logger.info(
-            "Received termination signal %d, draining all sinks...",
-            signum,
-        )
-        try:
-            self.drain_all(is_endofpipe=True)
-        finally:
-            super()._handle_termination(signum, frame)
+        _ = frame
+        if self._shutdown_requested:
+            # A repeated signal must not restart shutdown or duplicate work. The
+            # handler performs no I/O: logging from a signal handler can deadlock if
+            # the interrupted frame holds a logging lock.
+            return
+
+        self._shutdown_requested = True
+        self._shutdown_signum = signum
+
+        if self._interruptible:
+            raise TerminationRequested(signum)
 
     @classmethod
     def invoke(  # type: ignore[override]

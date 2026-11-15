@@ -111,6 +111,7 @@ class SQLTarget(Target):
             connector=self.target_connector,
         )
         sink.setup()
+        self._register_sink(sink)
         self._sinks_active[stream_name] = sink
 
         return sink
