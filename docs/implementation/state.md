@@ -151,6 +151,44 @@ this is not yet a supported use case within the SDK. If your source requires mul
 bookmark keys, and if it does not align with the [partitioning](../partitioning.md) feature,
 please open an issue with a detailed description of the intended use case.
 
+## Composite Cursors for Tied Replication Keys
+
+When many records share one replication key value, a scalar bookmark cannot identify
+which of those rows was processed last. Streams may opt in to a composite cursor by
+setting [`replication_key_tiebreakers`](../incremental_replication.md#composite-replication-cursors):
+
+```py
+class EventsStream(Stream):
+    replication_key = "updated_at"
+    replication_key_tiebreakers = ("shard_id", "event_id")
+    is_sorted = True
+```
+
+The complete position is `(replication_key, *tiebreakers)`. It is persisted
+atomically in the stream or partition bookmark under
+`replication_key_values`, alongside the legacy scalar `replication_key` /
+`replication_key_value` keys:
+
+```json
+{
+  "replication_key": "updated_at",
+  "replication_key_value": "2024-01-01T00:00:00Z",
+  "replication_key_type": "date-time",
+  "replication_key_tiebreakers": ["shard_id", "event_id"],
+  "replication_key_tiebreaker_types": ["integer", "string"],
+  "replication_key_values": ["2024-01-01T00:00:00Z", 7, "evt_42"]
+}
+```
+
+Only field names, their order and their types are stored, so state size and per-record
+work stay constant regardless of how many records share a primary key. Composite
+cursors require an incremental stream with `is_sorted = True`, `check_sorted = True`
+and `state_partitioning_keys = None`, and are not supported in `BATCH` mode.
+
+See [Incremental Replication: Composite replication cursors](../incremental_replication.md#composite-replication-cursors)
+for ordering rules, legacy-bookmark migration, `start_date` behavior, and the
+acknowledgement boundary.
+
 ## The Impact of Sorting on Incremental Sync
 
 For incremental streams sorted by replication key, the replication key

@@ -40,6 +40,11 @@ from singer_sdk.singerlib.catalog import (
     REPLICATION_INCREMENTAL,
     REPLICATION_LOG_BASED,  # noqa: F401
 )
+from singer_sdk.streams._composite import (
+    composite_signature,
+    get_composite_controller,
+    validate_disabled_composite_state,
+)
 from singer_sdk.streams._state import StreamStateManager
 
 if t.TYPE_CHECKING:
@@ -48,6 +53,7 @@ if t.TYPE_CHECKING:
     from singer_sdk.helpers._compat import Traversable
     from singer_sdk.mapper import StreamMap
     from singer_sdk.singerlib.catalog import StreamMetadata
+    from singer_sdk.streams._composite import CompositeCursorController
     from singer_sdk.tap_base import Tap
 
 
@@ -102,6 +108,26 @@ class Stream(abc.ABC):  # noqa: PLR0904
     selected_by_default: bool = True
     """Whether this stream is selected by default in the catalog."""
 
+    replication_key_tiebreakers: t.Sequence[str] | None = None
+    """Optional stable tiebreaker fields for composite incremental cursors.
+
+    When set to a non-empty sequence of top-level field names, the stream tracks
+    the complete record position: the :attr:`replication_key` value followed by
+    each tiebreaker in declaration order. This allows a sorted incremental
+    stream to resume from an exact position even when many records share the
+    same replication key value.
+
+    Each tiebreaker must exist in the effective schema as a non-null ``string``
+    or ``integer`` field, must be unique within the sequence, and may not be the
+    replication key itself. Composite cursors require an incremental stream with
+    ``is_sorted = True``, ``check_sorted = True`` and
+    ``state_partitioning_keys = None``, and are not supported in BATCH mode.
+
+    The default of ``None`` preserves the legacy scalar replication key behavior.
+
+    .. versionadded:: 0.55.0
+    """
+
     def __init__(
         self,
         tap: Tap,
@@ -152,6 +178,9 @@ class Stream(abc.ABC):  # noqa: PLR0904
         self._schema: dict | None = None
         self._sync_costs: dict[str, int] = {}
         self._state_manager: StreamStateManager | None = None
+        self._composite_controller: CompositeCursorController | None = None
+        self._composite_signature: tuple[t.Any, ...] | None = None
+        self._batch_mode_enabled = False
         self.child_streams: list[Stream] = []
 
         if schema:
@@ -303,10 +332,51 @@ class Stream(abc.ABC):  # noqa: PLR0904
            This method requires :attr:`~singer_sdk.Stream.replication_key` to be set
            to a non-null value, indicating the stream should be synced incrementally.
         """
+        controller = self._get_composite_controller()
+        if controller is not None:
+            # Composite mode still exposes the scalar primary-key starting point.
+            # The complete cursor is available from
+            # :meth:`get_starting_replication_key_values`.
+            return controller.get_starting(context).scalar_value
+
         return self.state_manager.get_starting_replication_value(
             context,
             self.replication_method,
         )
+
+    def get_starting_replication_key_values(
+        self,
+        context: types.Context | None,
+    ) -> tuple[t.Any, ...] | None:
+        """Get the complete starting replication cursor for a partition.
+
+        When :attr:`replication_key_tiebreakers` is configured, this returns the
+        full cursor tuple ``(replication_key_value, *tiebreaker_values)`` captured
+        at the start of the current sync. It returns ``None`` when the stream is
+        not using composite cursors, when there is no prior composite bookmark
+        (for example, the first run or a migrated legacy scalar bookmark), or
+        when a later ``start_date`` boundary replaces the bookmark.
+
+        The returned tuple is frozen for the duration of the sync: advancing the
+        bookmark as records are processed does not change it. Source queries may
+        use it to resume from the exact position instead of the scalar boundary.
+
+        For legacy scalar access, use
+        :meth:`get_starting_replication_key_value` (or
+        :meth:`get_starting_timestamp` for date-time keys).
+
+        Args:
+            context: Stream partition or context dictionary.
+
+        Returns:
+            The complete starting cursor values, or ``None``.
+
+        .. versionadded:: 0.55.0
+        """
+        controller = self._get_composite_controller()
+        if controller is None:
+            return None
+        return controller.get_starting_values(context)
 
     def get_starting_timestamp(
         self,
@@ -347,6 +417,29 @@ class Stream(abc.ABC):  # noqa: PLR0904
 
         result = datetime_fromisoformat(value)
         return result if result.tzinfo else result.replace(tzinfo=datetime.timezone.utc)
+
+    def _get_composite_controller(self) -> CompositeCursorController | None:
+        """Return the composite cursor controller, if enabled.
+
+        The controller is rebuilt if the stream's cursor configuration or schema
+        changes. Validation is deferred until the controller is first needed so
+        that regular (non-composite) streams are unaffected.
+
+        Returns:
+            A :class:`CompositeCursorController`, or ``None`` when tiebreakers
+            are not configured.
+        """
+        if self.replication_key_tiebreakers is None:
+            self._composite_controller = None
+            return None
+
+        signature = composite_signature(self)
+        if self._composite_controller is None or self._composite_signature != signature:
+            self._composite_controller = get_composite_controller(self)
+            self._composite_signature = (
+                signature if self._composite_controller else None
+            )
+        return self._composite_controller
 
     @property
     def selected(self) -> bool:
@@ -486,6 +579,12 @@ class Stream(abc.ABC):  # noqa: PLR0904
         calls, the value will be frozen (cached) at its initially called state, per
         partition argument if applicable.
 
+        Composite cursor streams do not use signposts: a signpost would fabricate
+        a position that no record was successfully processed at. When
+        :attr:`replication_key_tiebreakers` is configured, this default
+        implementation returns ``None`` unless a subclass explicitly overrides
+        this method.
+
         Developers may optionally override this method in advanced use cases such
         as unsorted incremental streams or complex hierarchical stream scenarios.
         For more info: :doc:`/implementation/state`
@@ -496,6 +595,9 @@ class Stream(abc.ABC):  # noqa: PLR0904
         Returns:
             Max allowable bookmark value for this stream's replication key.
         """
+        if self.replication_key_tiebreakers is not None:
+            return None
+
         return (
             datetime.datetime.fromtimestamp(
                 self._initialized_at / 1000.0,
@@ -814,6 +916,7 @@ class Stream(abc.ABC):  # noqa: PLR0904
         latest_record: types.Record,
         *,
         context: types.Context | None = None,
+        composite_values: tuple[t.Any, ...] | None = None,
     ) -> None:
         """Update state of stream or partition with data from the provided record.
 
@@ -826,6 +929,10 @@ class Stream(abc.ABC):  # noqa: PLR0904
         Args:
             latest_record: TODO
             context: Stream partition or context dictionary.
+            composite_values: Complete validated cursor values for the record,
+                when composite cursors are enabled. The bookmark is only written
+                once every value is known, so primary and tiebreaker values can
+                never come from different records.
 
         Raises:
             ValueError: TODO
@@ -836,6 +943,23 @@ class Stream(abc.ABC):  # noqa: PLR0904
                 msg = (
                     f"Could not detect replication key for '{self.name}' "
                     f"stream(replication method={self.replication_method})"
+                )
+                raise ValueError(msg)
+
+            if composite_values is not None:
+                controller = self._get_composite_controller()
+                if controller is not None:
+                    controller.write_bookmark(
+                        self.state_manager.get_context_state(context),
+                        composite_values,
+                    )
+                    return
+
+            controller = self._get_composite_controller()
+            if controller is not None:  # pragma: no cover - defensive
+                msg = (
+                    f"Composite replication cursor values are required for "
+                    f"incremental stream '{self.name}'."
                 )
                 raise ValueError(msg)
 
@@ -1175,7 +1299,7 @@ class Stream(abc.ABC):  # noqa: PLR0904
             if self.stream_maps[0].get_filter_result(record):
                 self._sync_children(copy.copy(context))
 
-    def _sync_records(  # noqa: C901
+    def _sync_records(  # noqa: C901, PLR0912, PLR0915
         self,
         context: types.Context | None = None,
         *,
@@ -1199,6 +1323,19 @@ class Stream(abc.ABC):  # noqa: PLR0904
         record: types.Record | None
         context_list: list[types.Context] | list[dict] | None
 
+        # Validate composite cursor configuration and state before requesting
+        # any source data. Both enabled and disabled streams are checked so that
+        # incompatible persisted state never silently loses progress.
+        composite_controller = self._get_composite_controller()
+        if composite_controller is not None:
+            batch_enabled = self._batch_mode_enabled or (
+                self.get_batch_config(self.config) is not None
+            )
+            composite_controller.validate_mode(batch_enabled=batch_enabled)
+            composite_controller.validate_state()
+        else:
+            validate_disabled_composite_state(self)
+
         # Initialize metrics
         record_counter = self.get_record_counter()
         timer = self.get_sync_timer()
@@ -1216,6 +1353,12 @@ class Stream(abc.ABC):  # noqa: PLR0904
                 state_partition_context = self._get_state_partition_context(
                     current_context,
                 )
+
+                # Freeze the composite starting position for this partition before
+                # any records are read or bookmarks advance.
+                if composite_controller is not None:
+                    composite_controller.get_starting(current_context)
+
                 self._write_starting_replication_value(current_context)
 
                 child_context: types.Context | None = (
@@ -1223,6 +1366,7 @@ class Stream(abc.ABC):  # noqa: PLR0904
                 )
 
                 for idx, record_result in enumerate(self.get_records(current_context)):
+                    source_index = idx + 1
                     self._check_max_record_limit(current_record_index=record_index)
 
                     if isinstance(record_result, tuple):  # pragma: no cover
@@ -1243,6 +1387,46 @@ class Stream(abc.ABC):  # noqa: PLR0904
                     if record is None:
                         continue
 
+                    composite_values: tuple[t.Any, ...] | None = None
+                    if composite_controller is not None:
+                        # Validate and check ordering before emitting the record
+                        # or syncing any child streams. Restored prefixes still
+                        # participate in the strict ordering check.
+                        composite_values = composite_controller.extract(
+                            record,
+                            current_context,
+                            source_index,
+                        )
+                        composite_keys = composite_controller.normalize(
+                            composite_values,
+                            current_context,
+                            source_index,
+                        )
+                        try:
+                            composite_controller.check_sorted(
+                                composite_keys,
+                                composite_values,
+                                current_context,
+                                source_index,
+                            )
+                        except InvalidStreamSortException as ex:
+                            self.state_manager.log_sort_error(
+                                ex=ex,
+                                record_count=record_index + 1,
+                                partition_record_count=source_index,
+                                current_context=current_context,
+                            )
+                            raise
+
+                        if composite_controller.should_skip(
+                            composite_keys,
+                            current_context,
+                        ):
+                            # Already processed in a previous run: do not emit,
+                            # sync children, advance the bookmark, or count as a
+                            # delivered record.
+                            continue
+
                     try:
                         self._process_record(
                             record,
@@ -1262,7 +1446,11 @@ class Stream(abc.ABC):  # noqa: PLR0904
                         if write_messages:
                             self._write_record_message(record)
 
-                        self._increment_stream_state(record, context=current_context)
+                        self._increment_stream_state(
+                            record,
+                            context=current_context,
+                            composite_values=composite_values,
+                        )
                         if (
                             record_index + 1
                         ) % self.STATE_MSG_FREQUENCY == 0 and write_messages:
@@ -1306,6 +1494,24 @@ class Stream(abc.ABC):  # noqa: PLR0904
 
     # Public methods ("final", not recommended to be overridden)
 
+    def _validate_composite_preflight(self, *, batch_enabled: bool) -> None:
+        """Validate composite cursor configuration before source access.
+
+        Args:
+            batch_enabled: Whether BATCH mode is enabled for this stream.
+
+        Raises:
+            ValueError: If composite cursors are misconfigured or persisted state
+                is incompatible.
+        """  # noqa: DOC502
+        controller = self._get_composite_controller()
+        if controller is not None:
+            controller.validate_mode(batch_enabled=batch_enabled)
+            controller.validate_state()
+            controller.reset()
+        else:
+            validate_disabled_composite_state(self)
+
     @t.final
     def sync(self, context: types.Context | None = None) -> None:
         """Sync this stream.
@@ -1328,8 +1534,22 @@ class Stream(abc.ABC):  # noqa: PLR0904
 
         self.context = MappingProxyType(context) if context else None
 
-        # Use a replication signpost, if available
-        if signpost := self.get_replication_key_signpost(context):
+        batch_config = self.get_batch_config(self.config)
+        self._batch_mode_enabled = batch_config is not None
+
+        # Validate composite cursor configuration and persisted state before
+        # reading any source data.
+        self._validate_composite_preflight(batch_enabled=self._batch_mode_enabled)
+
+        # Use a replication signpost, if available. Composite cursors never use
+        # signposts: a committed position must correspond to a record that was
+        # actually processed, even if a subclass returns a custom signpost.
+        if self.replication_key_tiebreakers is not None:
+            signpost = None
+        else:
+            signpost = self.get_replication_key_signpost(context)
+
+        if signpost:
             self._write_replication_key_signpost(context, signpost)
 
         # Send a SCHEMA message to the downstream target:
@@ -1345,7 +1565,6 @@ class Stream(abc.ABC):  # noqa: PLR0904
             self._write_activate_version_message(self._stream_version)
 
         try:
-            batch_config = self.get_batch_config(self.config)
             if batch_config:
                 self._sync_batches(batch_config, context=context)
             else:

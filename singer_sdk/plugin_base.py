@@ -257,7 +257,9 @@ class PluginBase(abc.ABC):
                 stacklevel=2,
             )
         elif isinstance(config, dict):
-            config_dict = config
+            # Copy so schema-default filling and env var parsing never mutate the
+            # dictionary provided by the caller.
+            config_dict = dict(config)
         else:
             msg = f"Error parsing config of type '{type(config).__name__}'."  # type: ignore[unreachable]
             raise TypeError(msg)

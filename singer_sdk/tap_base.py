@@ -5,6 +5,7 @@ from __future__ import annotations
 import abc
 import collections.abc
 import contextlib
+import copy
 import typing as t
 import warnings
 from enum import Enum
@@ -437,7 +438,9 @@ class Tap(BaseSingerWriter, abc.ABC):  # noqa: PLR0904
                     self.state,
                     stream_name,
                     key,
-                    val,
+                    # Copy nested values so the tap never mutates an object
+                    # provided by the caller (e.g. partition lists).
+                    copy.deepcopy(val),
                 )
 
     # State handling
